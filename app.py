@@ -25,6 +25,7 @@ import base64
 import json
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -164,7 +165,22 @@ def create_app(cfg: Config | None = None) -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = cfg.max_upload_bytes
     app.config["JSON_AS_ASCII"] = False
 
-    engine = RAGEngine(cfg)
+    # 多知识库：每个库一个 .db 文件，按需懒加载并常驻内存
+    _engines: dict[str, RAGEngine] = {}
+    _engines_lock = threading.Lock()
+
+    def get_engine(name: str) -> RAGEngine:
+        with _engines_lock:
+            if name not in _engines:
+                _engines[name] = RAGEngine(cfg, db_path=cfg.kb_file(name))
+                log.info("加载知识库：%s", name)
+            return _engines[name]
+
+    def current_kb() -> str:
+        name = request.cookies.get("kb") or "default"
+        return name if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name) else "default"
+
+    engine = get_engine("default")
     store = SessionStore(cfg.sessions_path)
     store.prune(keep_days=30)
 
@@ -226,14 +242,58 @@ def create_app(cfg: Config | None = None) -> Flask:
     def api_stats():
         sid, _ = current_sid(create=False)
         turns = store.count(sid) // 2 if sid else 0
-        st = engine.stats()
+        eng = get_engine(current_kb())
+        st = eng.stats()
         st.update({
             "turns": turns,
             "model": cfg.model,
             "num_ctx": cfg.num_ctx,
             "prompt_budget": cfg.prompt_budget,
+            "kb": current_kb(),
+            "kbs": _list_kbs(),
         })
         return jsonify(st)
+
+    def _list_kbs() -> list[dict]:
+        """扫描 data/db 下所有 .db，返回名字 + 块数（未加载的库只报文件名）。"""
+        out = []
+        for f in sorted(cfg.kb_dir.glob("*.db")):
+            name = f.stem
+            if name == "sessions":
+                continue
+            if name in _engines:
+                s = _engines[name].stats()
+                out.append({"name": name, "chunks": s["chunks"], "documents": s["documents"]})
+            else:
+                out.append({"name": name, "chunks": None, "documents": None})
+        if not any(k["name"] == "default" for k in out):
+            out.insert(0, {"name": "default", "chunks": None, "documents": None})
+        return out
+
+    @app.get("/api/kb/list")
+    def api_kb_list():
+        return jsonify(kbs=_list_kbs(), current=current_kb())
+
+    @app.post("/api/kb/switch")
+    def api_kb_switch():
+        name = (request.get_json(silent=True) or {}).get("name", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name or ""):
+            return jsonify(ok=False, error="库名只能包含字母、数字、下划线、短横线"), 400
+        get_engine(name)                      # 预加载，切换后第一次检索不卡
+        resp = jsonify(ok=True, current=name, stats=get_engine(name).stats())
+        resp.set_cookie("kb", name, max_age=30 * 86400, httponly=False, samesite="Lax")
+        return resp
+
+    @app.post("/api/kb/create")
+    def api_kb_create():
+        name = (request.get_json(silent=True) or {}).get("name", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name or ""):
+            return jsonify(ok=False, error="库名只能包含字母、数字、下划线、短横线"), 400
+        if cfg.kb_file(name).exists():
+            return jsonify(ok=False, error=f"知识库 {name} 已存在"), 400
+        get_engine(name)
+        log.info("创建知识库：%s", name)
+        return jsonify(ok=True, name=name)
 
     @app.get("/api/history")
     def api_history():
@@ -275,9 +335,10 @@ def create_app(cfg: Config | None = None) -> Flask:
 
         try:
             f.save(target)
-            result = engine.add_document(target)
+            eng = get_engine(current_kb())
+            result = eng.add_document(target)
             log.info("上传成功：%s → %d 块", filename, result["chunks"])
-            return jsonify(ok=True, **result, stats=engine.stats())
+            return jsonify(ok=True, **result, stats=eng.stats())
         except RAGError as exc:
             target.unlink(missing_ok=True)
             log.warning("上传失败 %s：%s", filename, exc)
@@ -301,7 +362,7 @@ def create_app(cfg: Config | None = None) -> Flask:
         except ValueError:
             return jsonify(ok=False, error="参数必须是整数"), 400
 
-        text = engine.page_text(doc, page)
+        text = get_engine(current_kb()).page_text(doc, page)
         if text is None:
             return jsonify(ok=False, error=f"找不到 {doc} 第 {page} 页"), 404
 
@@ -312,13 +373,14 @@ def create_app(cfg: Config | None = None) -> Flask:
 
     @app.get("/api/documents")
     def api_documents():
-        return jsonify(engine.list_documents())
+        return jsonify(get_engine(current_kb()).list_documents())
 
     @app.delete("/api/documents/<path:source>")
     def api_delete_document(source: str):
         try:
-            removed = engine.delete_document(source)
-            return jsonify(ok=True, removed=removed, stats=engine.stats())
+            eng = get_engine(current_kb())
+            removed = eng.delete_document(source)
+            return jsonify(ok=True, removed=removed, stats=eng.stats())
         except Exception as exc:  # noqa: BLE001
             log.exception("删除文档失败：%s", source)
             return jsonify(ok=False, error=str(exc)), 500
@@ -327,8 +389,9 @@ def create_app(cfg: Config | None = None) -> Flask:
     def api_rebuild():
         """把 docs 目录整个重新入库（换 embedding 模型后必须做）。"""
         try:
-            result = engine.build_from_dir(reset=True)
-            return jsonify(ok=result["ok"], **result, stats=engine.stats())
+            eng = get_engine(current_kb())
+            result = eng.build_from_dir(reset=True)
+            return jsonify(ok=result["ok"], **result, stats=eng.stats())
         except Exception as exc:  # noqa: BLE001
             log.exception("重建知识库失败")
             return jsonify(ok=False, error=str(exc)), 500
@@ -365,7 +428,7 @@ def create_app(cfg: Config | None = None) -> Flask:
 
         hits, best = [], 0.0
         try:
-            hits, best = engine.search(query)
+            hits, best = get_engine(current_kb()).search(query)
         except RAGError as exc:
             log.warning("检索降级：%s", exc)
         except Exception:  # noqa: BLE001
@@ -385,7 +448,8 @@ def create_app(cfg: Config | None = None) -> Flask:
                          "上一个问题", "刚才问", "刚才说", "记得", "上面说", "你刚才", "我问了")
         is_meta = any(p in question for p in META_PATTERNS)
 
-        if not hits and not is_meta and engine.ready:
+        _eng = get_engine(current_kb())
+        if not hits and not is_meta and _eng.ready:
             log.info("拒答（无召回）：%s | best=%.3f", question[:40], best)
             if sid:
                 try:
@@ -401,7 +465,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             return with_sid(Response(NO_HIT_ANSWER, mimetype="text/plain; charset=utf-8",
                                      headers=headers), sid, is_new)
 
-        messages, hits, meta = build_messages(cfg, history, hits, question, kb_ready=engine.ready)
+        messages, hits, meta = build_messages(cfg, history, hits, question, kb_ready=_eng.ready)
         payload = {
             "model": cfg.model,
             "stream": True,

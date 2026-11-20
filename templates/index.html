@@ -121,6 +121,9 @@
         <span id="statusText" class="text-xs text-slate-400 truncate">正在检测 Ollama…</span>
       </div>
       <div class="flex-1"></div>
+      <select id="kbSelect" title="切换知识库"
+              class="hidden sm:block text-xs bg-ink-700 border border-line rounded-lg px-2 py-1.5
+                     text-slate-300 max-w-[9rem] focus:outline-none focus:ring-1 focus:ring-sky-500/40"></select>
       <span id="turnBadge" class="text-[11px] text-slate-500 hidden sm:inline">记忆 0 轮</span>
       <button id="clearBtn"
               class="text-xs px-2.5 py-1.5 rounded-lg border border-line text-slate-400
@@ -380,6 +383,31 @@ document.getElementById('rebuildBtn').onclick = async () => {
   refreshStats();
 };
 
+/* ---------------- 知识库切换 ---------------- */
+async function loadKbs() {
+  const sel = document.getElementById('kbSelect');
+  if (!sel) return;
+  try {
+    const d = await (await fetch('/api/kb/list')).json();
+    sel.innerHTML = '';
+    (d.kbs || []).forEach(k => {
+      const o = document.createElement('option');
+      o.value = k.name;
+      o.textContent = k.name + (k.chunks ? ` · ${k.chunks} 块` : '');
+      if (k.name === d.current) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.onchange = async () => {
+      await fetch('/api/kb/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: sel.value })
+      });
+      location.reload();          // 换库等于换上下文，直接重载最干净
+    };
+  } catch (e) { console.warn('kb list failed', e); }
+}
+
 /* ---------------- 发送 ---------------- */
 let busy = false;
 
@@ -508,6 +536,7 @@ function greet() {
   } catch (e) { /* 首次访问无历史 */ }
 
   refreshStats();
+  loadKbs();
 })();
 </script>
 </body>

@@ -91,6 +91,7 @@ sequenceDiagram
 - **上下文预算**：`num_ctx` 固定上限，历史按轮次裁剪，响应头 `X-Ctx` 可查分配明细
 - **文档管理**：列表 / 删除 / 一键重建，全部在 UI 里完成
 - **离线优先**：Tailwind、marked、highlight 全部本地化，断网不影响渲染
+- **多知识库**：每个库一个 `.db` 文件，顶栏下拉切换（计组 / 数据结构 / 操作系统各一个，互不污染）
 - **PWA**：可"添加到主屏幕"，全屏无地址栏，像原生 App
 - **可观测**：结构化日志（控制台 + 轮转文件），每个失败分支都有 `log.exception`
 
@@ -213,6 +214,10 @@ ollama ps                                                             # 100% GPU
 | `GET` | `/api/documents` | 文档列表（含块数） |
 | `DELETE` | `/api/documents/<name>` | 删除文档及向量 |
 | `POST` | `/api/rebuild` | 清空并重新扫描 `data/docs` |
+| `GET` | `/api/source?doc=&page=&start=&end=` | 取原文片段（引用高亮用） |
+| `GET` | `/api/kb/list` | 列出所有知识库 |
+| `POST` | `/api/kb/create` | `{"name":"os-course"}` 新建空库 |
+| `POST` | `/api/kb/switch` | `{"name":"os-course"}` 切换当前库（写 Cookie） |
 | `GET` | `/api/health` | Ollama 连通性 |
 
 `X-Ctx` 示例（演示时按 F12 可直接展示上下文预算）：

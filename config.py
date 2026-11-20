@@ -63,7 +63,7 @@ class Config:
     docs_dir: Path
     db_dir: Path
     log_dir: Path
-    kb_path: Path
+    kb_dir: Path
     sessions_path: Path
 
     # ---- 模型 ----
@@ -96,6 +96,11 @@ class Config:
         return max(512, self.num_ctx - self.reserve_output)
 
     @property
+    def kb_path(self) -> Path:
+        """默认知识库文件。多知识库时由调用方传 db_path 覆盖。"""
+        return self.kb_dir / "default.db"
+
+    @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
 
@@ -109,7 +114,7 @@ class Config:
             docs_dir=data / "docs",
             db_dir=data / "db",
             log_dir=root / "logs",
-            kb_path=data / "db" / "knowledge.db",
+            kb_dir=data / "db",
             sessions_path=data / "db" / "sessions.db",
             ollama_base=_env_str("OLLAMA_BASE", "http://127.0.0.1:11434").rstrip("/"),
             model=_env_str("OLLAMA_MODEL", "qwen2.5-coder:7b"),
@@ -131,6 +136,11 @@ class Config:
         for d in (cfg.data_dir, cfg.docs_dir, cfg.db_dir, cfg.log_dir):
             d.mkdir(parents=True, exist_ok=True)
         return cfg
+
+    def kb_file(self, name: str) -> Path:
+        """按知识库名取文件路径。名字只允许字母数字下划线，防止路径穿越。"""
+        safe = "".join(ch for ch in name if ch.isalnum() or ch in "-_") or "default"
+        return self.kb_dir / f"{safe}.db"
 
     def summary(self) -> dict:
         """启动时打印 / 写日志用，便于排查"为什么模型不在 D 盘"这类问题。"""
