@@ -202,7 +202,13 @@ function addMessage(role, text = '') {
     ? 'order-1 max-w-[85%] rounded-2xl rounded-tr-sm bubble-user text-white text-sm px-4 py-2.5 whitespace-pre-wrap'
     : 'max-w-[92%] rounded-2xl rounded-tl-sm bg-ink-700 border border-line text-sm px-4 py-3 md';
 
-  if (role === 'user') bubble.textContent = text;
+  // 两种角色都要把 text 渲染出来：
+  //   user → 纯文本（textContent，天然防 XSS）
+  //   assistant → Markdown（走 renderMarkdown，内部有 DOMPurify 净化）
+  if (text) {
+    if (role === 'user') bubble.textContent = text;
+    else bubble.replaceChildren(renderMarkdown(text));
+  }
   wrap.append(avatar, bubble);
   logEl.appendChild(wrap);
   logEl.scrollTop = logEl.scrollHeight;
@@ -408,7 +414,9 @@ overlay.onclick = () => toggleSidebar(false);
 function greet() {
   addMessage('assistant',
     '我是运行在这台电脑上的本地模型：可以查 `data/docs` 里的知识库，也会记住这次对话。' +
-    '网络已断开，所有推理都在本机 GPU 上完成。\n\n试着问一个教材里的问题，或者上传一份 PDF。');
+    '网络已断开，所有推理都在本机 GPU 上完成。\n\n' +
+    '**手机上**点左上角 ☰ 打开知识库面板，可以上传 PDF 或查看已入库的文档。\n\n' +
+    '试着问一个教材里的问题，或者上传一份 PDF。');
 }
 
 (async function boot() {
