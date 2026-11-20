@@ -304,8 +304,10 @@ def create_app(cfg: Config | None = None) -> Flask:
         question = (data.get("message") or "").strip()
         if not question:
             return jsonify(ok=False, error="消息不能为空"), 400
-        if len(question) > 8000:
-            return jsonify(ok=False, error="问题过长（上限 8000 字）"), 400
+        if len(question) > 4000:
+            # 4000 字 ≈ 4000 token，已吃掉 prompt 预算（6992）的一半以上，
+            # 再长就会把 RAG 片段和历史全部挤掉，甚至超 num_ctx 被模型静默截断
+            return jsonify(ok=False, error="问题过长（上限 4000 字，约 4000 token）"), 400
 
         sid, is_new = current_sid()
         history = store.history(sid, limit=40) if sid else []
