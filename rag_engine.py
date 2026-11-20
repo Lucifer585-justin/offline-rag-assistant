@@ -335,6 +335,22 @@ class RAGEngine:
             row["score"] = round(s, 4)
             hits.append(row)
         best = float(scores[idx[0]]) if len(idx) else 0.0
+
+        # ------------------------------------------------------------------
+        # 区分度判据（margin）：只看绝对分数会误召回。
+        # 实测反例：问"写一个 python 快速排序"，计组教材的 3 个片段拿到
+        # 0.4605 / 0.4557 / 0.4539 —— 全部擦着阈值过线，且彼此只差 0.0066。
+        # 这说明模型对这段文本没有"明显偏好"，只是泛泛相关（背景噪声）。
+        # 真命中时通常有明显断层：0.6275 / 0.6134 / 0.6059（差 0.0216）。
+        # 所以：top1 - topN < margin 时判为噪声，直接当作没找到。
+        # ------------------------------------------------------------------
+        if len(hits) >= 2:
+            margin = hits[0]["score"] - hits[-1]["score"]
+            if margin < self.cfg.min_margin and hits[0]["score"] < 0.62:
+                log.info("检索区分度不足，判为噪声：margin=%.4f (<%.3f) best=%.3f，已丢弃 %d 段",
+                         margin, self.cfg.min_margin, hits[0]["score"], len(hits))
+                return [], best
+
         return hits, best
 
     # ------------------------------------------------------------------ 管理

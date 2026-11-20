@@ -76,6 +76,7 @@ class Config:
     # ---- 检索 ----
     top_k: int
     min_score: float
+    min_margin: float
     chunk_size: int
     chunk_overlap: int
     embed_batch: int
@@ -116,6 +117,7 @@ class Config:
             reserve_output=_env_int("RESERVE_OUTPUT", 1200),
             top_k=_env_int("RAG_TOP_K", 3),
             min_score=_env_float("RAG_MIN_SCORE", 0.45),
+            min_margin=_env_float("RAG_MIN_MARGIN", 0.015),
             chunk_size=_env_int("CHUNK_SIZE", 500),
             chunk_overlap=_env_int("CHUNK_OVERLAP", 100),
             embed_batch=_env_int("EMBED_BATCH", 16),
