@@ -185,6 +185,19 @@ def create_app(cfg: Config | None = None) -> Flask:
             resp.set_cookie("sid", sid, max_age=30 * 86400, httponly=True, samesite="Lax")
         return resp
 
+    # ------------------------------------------------------------------ PWA
+    @app.get("/sw.js")
+    def service_worker():
+        """
+        Service Worker 必须从根路径提供，作用域才是 /；
+        放在 /static/sw.js 的话 scope 会被限制在 /static/，页面收不到控制。
+        """
+        from flask import send_from_directory
+        resp = send_from_directory(Path(app.root_path) / "static", "sw.js",
+                                   mimetype="application/javascript")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     # ------------------------------------------------------------------ 页面
     @app.get("/")
     def index():
@@ -273,6 +286,29 @@ def create_app(cfg: Config | None = None) -> Flask:
             target.unlink(missing_ok=True)
             log.exception("上传异常 %s", filename)
             return jsonify(ok=False, error=f"处理失败：{exc}"), 500
+
+    @app.get("/api/source")
+    def api_source():
+        """
+        取某文档某页的原文，供前端做引用高亮。
+        只返回清洗后的页文本 + 字符区间，前端自己切片，避免把 HTML 从这里吐出去。
+        """
+        doc = request.args.get("doc", "")
+        try:
+            page = int(request.args.get("page", 0))
+            start = int(request.args.get("start", 0))
+            end = int(request.args.get("end", 0))
+        except ValueError:
+            return jsonify(ok=False, error="参数必须是整数"), 400
+
+        text = engine.page_text(doc, page)
+        if text is None:
+            return jsonify(ok=False, error=f"找不到 {doc} 第 {page} 页"), 404
+
+        # 区间兜底：老数据可能没有 offset，或超出范围
+        start = max(0, min(start, len(text)))
+        end = max(start, min(end, len(text)))
+        return jsonify(ok=True, source=doc, page=page, start=start, end=end, text=text)
 
     @app.get("/api/documents")
     def api_documents():
@@ -375,6 +411,7 @@ def create_app(cfg: Config | None = None) -> Flask:
 
         sources = [
             {"n": i, "source": h["source"], "page": h["page"], "score": h["score"],
+             "start": h.get("char_start", 0), "end": h.get("char_end", 0),
              "preview": h["text"][:120].replace("\n", " ")}
             for i, h in enumerate(hits, 1)
         ]

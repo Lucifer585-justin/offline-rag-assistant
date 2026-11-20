@@ -77,6 +77,7 @@ class Config:
     top_k: int
     min_score: float
     min_margin: float
+    bm25_min: float
     chunk_size: int
     chunk_overlap: int
     embed_batch: int
@@ -118,6 +119,7 @@ class Config:
             top_k=_env_int("RAG_TOP_K", 3),
             min_score=_env_float("RAG_MIN_SCORE", 0.45),
             min_margin=_env_float("RAG_MIN_MARGIN", 0.015),
+            bm25_min=_env_float("RAG_BM25_MIN", 2.5),
             chunk_size=_env_int("CHUNK_SIZE", 500),
             chunk_overlap=_env_int("CHUNK_OVERLAP", 100),
             embed_batch=_env_int("EMBED_BATCH", 16),

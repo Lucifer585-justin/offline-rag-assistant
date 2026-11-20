@@ -1,0 +1,20 @@
+{
+  "name": "Offline RAG Assistant",
+  "short_name": "RAG 助教",
+  "description": "本地大模型 + 本地知识库 + 多轮记忆，全程离线",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

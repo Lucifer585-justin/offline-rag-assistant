@@ -1,30 +1,25 @@
 """
-rag_engine.py — 检索增强引擎（文档 → 向量库 → 检索）
+rag_engine.py — 检索增强引擎（混合检索版）
 
-把原来拆在两个文件里的 build_db.py（建库）和 retriever.py（检索）合并成一个类，
-因为它们的生命周期是绑定的：建库后要立刻让检索看到新数据，分两个模块就得靠调用方
-自己协调"重新加载"，很容易出 bug（改了库但内存里还是旧矩阵）。
+相对上一版的三个升级：
+  1. **混合检索**：向量（语义）+ BM25（关键词）双路召回，RRF 融合排名。
+     解决的痛点：问"组相联映射的 k 是多少"时，纯向量会飘到讲"Cache 结构"的泛段落，
+     而真正答案里恰好有"组相联"三个字 —— BM25 一抓就中。
+  2. **引用可定位**：每个 chunk 记录它在所属页文本里的字符区间 (char_start, char_end)，
+     前端点 [1] 就能展开原文并高亮那一段。
+  3. **增量索引**：files 表记录 sha256 + mtime，重建时跳过没变的文件。
 
-数据流：
-    PDF/TXT/MD ──抽取──▶ 原文 ──清洗──▶ 段落 ──切块(500/100)──▶ chunks
-                                        └── bge-m3 编码 ──▶ float32 向量
-                                                              │
-                                                              ▼
-                                                    SQLite (chunks 表)
-                                                              │
-    用户问题 ──bge-m3 编码──▶ q ── 余弦相似度(矩阵乘法) ──▶ top-k 片段
-
-为什么用 SQLite + numpy 而不是 Chroma/FAISS：
-    · 零额外依赖：sqlite3 是标准库，numpy 只做一次矩阵乘法；
-    · 完全透明：相似度就是 dot(q, M)，没有黑盒索引，讲得清；
-    · 规模匹配：1 万块以内暴力检索 5~20ms，比服务化方案更快；
-    · 单文件：knowledge.db 拷走就能用。
+数据模型：
+    chunks(id, source, page, seq, text, vec, char_start, char_end)
+    pages (source, page, text)          ← 存清洗后的页文本，供前端展示原文
+    files (source, sha256, size, mtime, chunks, indexed_at)   ← 增量索引用
+    meta  (key, value)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -35,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bm25 import BM25, rrf_fuse
 from config import Config
 from logger import get_logger
 
@@ -42,14 +38,30 @@ log = get_logger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    page   INTEGER NOT NULL DEFAULT 0,
-    seq    INTEGER NOT NULL DEFAULT 0,
-    text   TEXT NOT NULL,
-    vec    BLOB NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT NOT NULL,
+    page       INTEGER NOT NULL DEFAULT 0,
+    seq        INTEGER NOT NULL DEFAULT 0,
+    text       TEXT NOT NULL,
+    vec        BLOB NOT NULL,
+    char_start INTEGER NOT NULL DEFAULT 0,
+    char_end   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_source ON chunks(source);
+CREATE TABLE IF NOT EXISTS pages (
+    source TEXT NOT NULL,
+    page   INTEGER NOT NULL,
+    text   TEXT NOT NULL,
+    PRIMARY KEY (source, page)
+);
+CREATE TABLE IF NOT EXISTS files (
+    source     TEXT PRIMARY KEY,
+    sha256     TEXT,
+    size       INTEGER,
+    mtime      REAL,
+    chunks     INTEGER,
+    indexed_at REAL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -61,83 +73,101 @@ class RAGError(RuntimeError):
 
 
 # ==============================================================================
-# 文本处理（纯函数，方便单测）
+# 文本处理
 # ==============================================================================
 def clean_text(text: str) -> str:
-    """
-    清洗 PDF 抽出来的脏文本，三类噪声最常见：
-      1. 纯页码行（"12" / "- 12 -" / "第 12 页"）
-      2. 中文行尾被硬换行切断（PDF 按版面断行，不是按语义）
-      3. 连续空行 / 多余空格
-    """
+    """清洗 PDF 文本：去页码行、修复硬换行、压掉多余空行。"""
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u3000", " ")
     text = re.sub(r"(?m)^\s*(?:[-—–]\s*)?\d{1,4}\s*(?:[-—–])?\s*$", "", text)
     text = re.sub(r"(?m)^\s*第\s*\d+\s*页\s*$", "", text)
-    # 上一行不是句末标点、下一行以中文开头 → 合并（修复 PDF 硬换行）
     text = re.sub(r"(?<=[^\n。！？；：\.\!\?;:])\n(?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def split_chunks(text: str, size: int = 500, overlap: int = 100) -> list[str]:
+def split_chunks_spans(text: str, size: int = 500, overlap: int = 100):
     """
-    切块策略：按段落累积到 size 就封口，并从块尾取 overlap 字作为下一块开头。
-    重叠的作用：答案正好跨在切口上时，至少有一块是完整的。
+    切块并返回每块在原文中的字符区间：[(chunk_text, start, end), ...]
 
-    超长段落（比如整章没有空行）会先按句号拆成句子，再逐句塞。
+    实现要点：**不做字符串拼接**，只用"区间列表 + 原文切片"。
+    上一版用 buf += s 累加，再用 len(buf) 反推位置，一旦重叠或多段拼接就会漂移
+    1~2 个字符（实测 7 块里错 3 块），前端高亮就会圈错字。
+    现在所有 offset 直接来自 re.finditer 的 match.start()/end()，绝对对齐。
+
+    切块单位是"句子"（按中文标点/换行切），再按 size 累积：
+      - 句子边界天然适合作为语义边界
+      - 单段超过 size 时，句子本身会被拆开累积，不会撑爆
     """
     if not text:
         return []
 
-    paras = [p.strip() for p in re.split(r"\n\s*\n|\n", text) if p.strip()]
-    chunks: list[str] = []
-    buf = ""
+    units = [(m.start(), m.end()) for m in
+             re.finditer(r"[^。！？；\.\!\?;\n]+[。！？；\.\!\?;]?", text)
+             if m.group().strip()]
+    if not units:
+        return []
 
-    def flush() -> None:
-        nonlocal buf
-        if buf.strip():
-            chunks.append(buf.strip())
-        buf = buf[-overlap:] if overlap > 0 else ""
+    out = []
+    i = 0
+    n = len(units)
+    while i < n:
+        start = units[i][0]
+        end = units[i][1]
+        j = i
+        # 向后吞句子，直到再加一句就会超过 size
+        while j + 1 < n and units[j + 1][1] - start <= size:
+            j += 1
+            end = units[j][1]
 
-    for p in paras:
-        if len(p) > size:
-            for sent in re.split(r"(?<=[。！？；\.\!\?;])", p):
-                if not sent.strip():
-                    continue
-                if len(buf) + len(sent) > size:
-                    flush()
-                buf += sent
-        else:
-            if len(buf) + len(p) + 1 > size:
-                flush()
-            buf += p + "\n"
-    if buf.strip():
-        chunks.append(buf.strip())
+        chunk = text[start:end].strip()
+        if len(chunk) >= 20:
+            out.append((chunk, start, end))
 
-    return [c for c in chunks if len(c) >= 20]
+        if j >= n - 1:
+            break
+
+        # 重叠：下一块的起点回退 overlap 字符，再对齐到最近的句子起点
+        target = max(start + 1, end - overlap)
+        k = j + 1
+        while k < n and units[k][0] < target:
+            k += 1
+        i = k if k > j else j + 1
+
+    return out
 
 
 # ==============================================================================
 # 引擎
 # ==============================================================================
 class RAGEngine:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, db_path: Path | None = None):
         self.cfg = cfg
-        self.db_path = str(cfg.kb_path)
-        self._lock = threading.RLock()          # 上传与检索并发时保护内存矩阵
-        self._matrix: np.ndarray | None = None  # (n, dim) 已归一化
-        self._rows: list[dict] = []             # 与矩阵行一一对应
+        self.db_path = str(db_path or cfg.kb_path)
+        self._lock = threading.RLock()
+        self._matrix: np.ndarray | None = None
+        self._rows: list[dict] = []
+        self._bm25: BM25 | None = None
         self._dim = 0
-        self._model = cfg.embed_model
         self._error: str | None = None
 
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(SCHEMA)
+            self._migrate(con)
         self.reload()
+
+    @staticmethod
+    def _migrate(con: sqlite3.Connection) -> None:
+        """老库没有 char_start/char_end 列，就地补上，避免用户必须重建。"""
+        cols = {r[1] for r in con.execute("PRAGMA table_info(chunks)")}
+        if "char_start" not in cols:
+            con.execute("ALTER TABLE chunks ADD COLUMN char_start INTEGER NOT NULL DEFAULT 0")
+        if "char_end" not in cols:
+            con.execute("ALTER TABLE chunks ADD COLUMN char_end INTEGER NOT NULL DEFAULT 0")
+        con.commit()
 
     # ------------------------------------------------------------------ 基础
     def _conn(self) -> sqlite3.Connection:
@@ -148,25 +178,29 @@ class RAGEngine:
 
     # ------------------------------------------------------------------ 载入
     def reload(self) -> None:
-        """把全库向量读进内存并预先归一化（检索时点积即余弦相似度）。"""
+        """载入向量矩阵 + 构建 BM25 索引（两者都常驻内存）。"""
         with self._lock:
             try:
                 with self._conn() as con:
                     rows = con.execute(
-                        "SELECT id, source, page, seq, text, vec FROM chunks ORDER BY id"
-                    ).fetchall()
+                        "SELECT id, source, page, seq, text, vec, char_start, char_end "
+                        "FROM chunks ORDER BY id").fetchall()
                     meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
 
                 if not rows:
-                    self._matrix, self._rows, self._dim = None, [], 0
+                    self._matrix, self._rows, self._bm25, self._dim = None, [], None, 0
                     self._error = "知识库为空，请先上传文档"
                     return
 
-                vecs, metas = [], []
+                vecs, metas, texts = [], [], []
                 for r in rows:
                     vecs.append(np.frombuffer(r["vec"], dtype=np.float32))
-                    metas.append({"id": r["id"], "source": r["source"],
-                                  "page": r["page"], "seq": r["seq"], "text": r["text"]})
+                    metas.append({
+                        "id": r["id"], "source": r["source"], "page": r["page"],
+                        "seq": r["seq"], "text": r["text"],
+                        "char_start": r["char_start"], "char_end": r["char_end"],
+                    })
+                    texts.append(r["text"])
 
                 matrix = np.vstack(vecs).astype(np.float32)
                 norms = np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -175,26 +209,24 @@ class RAGEngine:
                 self._rows = metas
                 self._dim = matrix.shape[1]
 
-                # 维度校验：换过 embedding 模型却没重建库，检索结果会完全错乱
+                self._bm25 = BM25()
+                self._bm25.fit(texts)
+
                 saved_dim = meta.get("dim")
                 if saved_dim and int(saved_dim) != self._dim:
                     self._error = f"向量维度不一致（库 {saved_dim} / 当前 {self._dim}），请重建知识库"
                     log.error(self._error)
                 else:
                     self._error = None
-                log.info("知识库载入：%d 块 / %d 维", len(self._rows), self._dim)
+                log.info("知识库载入：%d 块 / %d 维 / BM25 词表 %d",
+                         len(self._rows), self._dim, len(self._bm25.df))
             except Exception as exc:  # noqa: BLE001
                 self._error = f"载入知识库失败：{exc}"
                 log.exception("载入知识库失败")
 
     # ------------------------------------------------------------------ 编码
     def embed(self, texts: list[str], timeout: int = 300) -> np.ndarray:
-        """
-        调 Ollama /api/embed 批量编码。
-        options.num_gpu=0：把 embedding 钉在 CPU —— 8GB 显存里 bge-m3 和 7B 抢显存时，
-        Ollama 会把整个 7B 退回 CPU，生成速度从 58 tok/s 掉到 5 tok/s。
-        bge-m3 在 CPU 上编码一句话约 100ms，宁可慢一点也要把 GPU 让给生成模型。
-        """
+        """批量编码；num_gpu=0 把 embedding 钉在 CPU，不跟生成模型抢显存。"""
         payload = json.dumps({
             "model": self.cfg.embed_model,
             "input": texts,
@@ -202,8 +234,7 @@ class RAGEngine:
         }, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             f"{self.cfg.ollama_base}/api/embed", data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
+            headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -211,26 +242,24 @@ class RAGEngine:
             raise RAGError(f"embedding 接口返回 {exc.code}，检查模型 {self.cfg.embed_model} 是否存在") from exc
         except urllib.error.URLError as exc:
             raise RAGError(f"连不上 Ollama（{self.cfg.ollama_base}）：{exc.reason}") from exc
-
         if "embeddings" not in data:
             raise RAGError(f"embedding 响应异常：{str(data)[:200]}")
         return np.asarray(data["embeddings"], dtype=np.float32)
 
     # ------------------------------------------------------------------ 抽取
     def extract_text(self, path: Path) -> list[tuple[int, str]]:
-        """返回 [(页码, 文本)]。扫描件 PDF 抽不出字，返回空页。"""
         ext = path.suffix.lower()
         if ext == ".pdf":
             try:
                 try:
-                    import pymupdf as fitz          # 新版包名
+                    import pymupdf as fitz
                 except ImportError:
-                    import fitz                     # 旧版包名，仍兼容
+                    import fitz
                 with fitz.open(path) as doc:
                     return [(i, page.get_text("text")) for i, page in enumerate(doc, start=1)]
             except ImportError:
                 from pypdf import PdfReader
-                return [(i, page.extract_text() or "")
+                return [(i, page.get_text() or "")
                         for i, page in enumerate(PdfReader(str(path)).pages, start=1)]
         if ext in {".txt", ".md", ".markdown"}:
             for enc in ("utf-8", "utf-8-sig", "gbk", "gb18030"):
@@ -242,35 +271,55 @@ class RAGEngine:
         raise RAGError(f"不支持的文件类型：{ext}")
 
     # ------------------------------------------------------------------ 入库
-    def add_document(self, path: Path) -> dict:
+    def add_document(self, path: Path, force: bool = False) -> dict:
         """
-        解析 → 清洗 → 切块 → 编码 → 写库 → 刷新内存矩阵。
-        同名文档重复上传时先清旧块（相当于覆盖更新）。
+        解析 → 清洗 → 切块（带字符区间）→ 编码 → 写库 → 重建内存索引。
+        增量：同一个文件 sha256 没变就跳过（force=True 强制重建）。
         """
         started = time.time()
         source = path.name
-        pages = self.extract_text(path)
-        pieces: list[tuple[str, int]] = []
-        for page_no, raw in pages:
-            for ck in split_chunks(clean_text(raw), self.cfg.chunk_size, self.cfg.chunk_overlap):
-                pieces.append((ck, page_no))
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
 
-        if not pieces:
+        if not force:
+            with self._conn() as con:
+                row = con.execute("SELECT sha256 FROM files WHERE source=?", (source,)).fetchone()
+            if row and row["sha256"] == digest:
+                log.info("跳过未变更文档：%s", source)
+                return {"source": source, "skipped": True, "chunks": 0, "pages": 0, "ms": 0}
+
+        pages = self.extract_text(path)
+        page_rows, piece_rows, vectors = [], [], []
+
+        for page_no, raw_text in pages:
+            cleaned = clean_text(raw_text)
+            if not cleaned:
+                continue
+            page_rows.append((source, page_no, cleaned))
+            for txt, s, e in split_chunks_spans(cleaned, self.cfg.chunk_size, self.cfg.chunk_overlap):
+                piece_rows.append((page_no, len(piece_rows), txt, s, e))
+
+        if not piece_rows:
             raise RAGError("没有抽到可用文本（扫描版 PDF 需要先做 OCR）")
 
-        vectors = []
-        for i in range(0, len(pieces), self.cfg.embed_batch):
-            batch = [p[0] for p in pieces[i:i + self.cfg.embed_batch]]
+        for i in range(0, len(piece_rows), self.cfg.embed_batch):
+            batch = [p[2] for p in piece_rows[i:i + self.cfg.embed_batch]]
             vectors.append(self.embed(batch))
         matrix = np.vstack(vectors)
 
         with self._lock, self._conn() as con:
             con.execute("DELETE FROM chunks WHERE source=?", (source,))
+            con.execute("DELETE FROM pages WHERE source=?", (source,))
+            con.executemany("INSERT OR REPLACE INTO pages(source, page, text) VALUES(?,?,?)", page_rows)
             con.executemany(
-                "INSERT INTO chunks(source, page, seq, text, vec) VALUES(?,?,?,?,?)",
-                [(source, pieces[i][1], i, pieces[i][0], matrix[i].tobytes())
-                 for i in range(len(pieces))],
-            )
+                "INSERT INTO chunks(source, page, seq, text, vec, char_start, char_end) "
+                "VALUES(?,?,?,?,?,?,?)",
+                [(source, p[0], p[1], p[2], matrix[i].tobytes(), p[3], p[4])
+                 for i, p in enumerate(piece_rows)])
+            con.execute(
+                "INSERT OR REPLACE INTO files(source, sha256, size, mtime, chunks, indexed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (source, digest, len(raw), path.stat().st_mtime, len(piece_rows), time.time()))
             con.execute("INSERT OR REPLACE INTO meta VALUES('embed_model', ?)", (self.cfg.embed_model,))
             con.execute("INSERT OR REPLACE INTO meta VALUES('dim', ?)", (str(matrix.shape[1]),))
             con.execute("INSERT OR REPLACE INTO meta VALUES('updated_at', ?)",
@@ -279,34 +328,41 @@ class RAGEngine:
 
         self.reload()
         elapsed = int((time.time() - started) * 1000)
-        log.info("文档入库：%s → %d 块 / %d 页 / %d ms", source, len(pieces), len(pages), elapsed)
-        return {"source": source, "pages": len(pages), "chunks": len(pieces), "ms": elapsed}
+        log.info("文档入库：%s → %d 块 / %d 页 / %d ms", source, len(piece_rows), len(page_rows), elapsed)
+        return {"source": source, "pages": len(page_rows), "chunks": len(piece_rows),
+                "ms": elapsed, "skipped": False}
 
     def build_from_dir(self, reset: bool = False) -> dict:
-        """扫描 data/docs 下所有文档并逐个入库（首次初始化 / 重建用）。"""
+        """扫描 docs 目录批量入库；reset=True 先清空。未变更文件自动跳过。"""
         if reset:
             with self._lock, self._conn() as con:
                 con.execute("DELETE FROM chunks")
+                con.execute("DELETE FROM pages")
+                con.execute("DELETE FROM files")
                 con.commit()
             log.warning("知识库已清空（reset=True）")
 
-        results, errors = [], []
+        results, errors, skipped = [], [], 0
         for path in sorted(Path(self.cfg.docs_dir).rglob("*")):
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXT:
                 try:
-                    results.append(self.add_document(path))
+                    info = self.add_document(path)
+                    if info.get("skipped"):
+                        skipped += 1
+                    else:
+                        results.append(info)
                 except Exception as exc:  # noqa: BLE001
                     log.exception("入库失败：%s", path.name)
                     errors.append({"source": path.name, "error": str(exc)})
         return {"ok": len(errors) == 0, "documents": results, "errors": errors,
-                "chunks": sum(r["chunks"] for r in results)}
+                "chunks": sum(r["chunks"] for r in results), "skipped": skipped}
 
     # ------------------------------------------------------------------ 检索
     def search(self, query: str, top_k: int | None = None,
                min_score: float | None = None) -> tuple[list[dict], float]:
         """
-        返回 (hits, best_score)。hits 为空表示"没找到相关内容"，调用方应据此拒答。
-        相似度 = 归一化后的点积，一次矩阵乘法算完全库。
+        混合检索：向量 Top-N + BM25 Top-N → RRF 融合 → 取 top_k。
+        阈值与区分度判据仍基于**向量分数**（语义相关性更接近"能不能答"）。
         """
         top_k = top_k or self.cfg.top_k
         thr = self.cfg.min_score if min_score is None else min_score
@@ -314,70 +370,107 @@ class RAGEngine:
         with self._lock:
             if self._matrix is None or not self._rows:
                 return [], 0.0
-            matrix, rows = self._matrix, self._rows
+            matrix, rows, bm25 = self._matrix, self._rows, self._bm25
 
         q = self.embed([query])[0]
         if q.shape[0] != matrix.shape[1]:
             raise RAGError(f"问题向量维度 {q.shape[0]} 与库 {matrix.shape[1]} 不一致，请重建知识库")
         q = q / (np.linalg.norm(q) or 1.0)
 
-        scores = matrix @ q
-        k = min(top_k, len(scores))
-        idx = np.argpartition(-scores, k - 1)[:k]
-        idx = idx[np.argsort(-scores[idx])]
+        vec_scores = matrix @ q
+        bm_scores = np.asarray(bm25.scores(query), dtype=np.float32) if bm25 else np.zeros_like(vec_scores)
+        bm_max = float(bm_scores.max()) if len(bm_scores) else 0.0
+
+        # 两路各取 4 倍候选，融合后再收敛到 top_k
+        cand = min(len(vec_scores), max(top_k * 4, 20))
+        v_idx = np.argsort(-vec_scores)[:cand].tolist()
+        b_idx = np.argsort(-bm_scores)[:cand].tolist()
+        fused = rrf_fuse([v_idx, b_idx])
+
+        ranked = sorted(fused.items(), key=lambda kv: -kv[1])[:top_k]
 
         hits = []
-        for i in idx:
-            s = float(scores[i])
-            if s < thr:
+        for i, fscore in ranked:
+            vs = float(vec_scores[i])
+            bs = float(bm_scores[i])
+            # 双通道放行：语义过阈值 OR 关键词强命中。
+            # 关键词判据必须同时满足"绝对分够高"和"是 BM25 里的头名"：
+            #   绝对分（>=1.0）过滤掉"算法""方式"这类到处都有的常见词（IDF 低，得分 < 1）
+            #   相对分（>=60% 最高分）过滤掉一群词都很弱命中的块
+            # 典型受益者："BTB 是什么" 向量分只有 0.25，但原文明确写着"转移目标缓冲器 BTB"
+            kw_strong = bs >= self.cfg.bm25_min and bs >= bm_max * 0.6
+            if vs < thr and not kw_strong:
                 continue
             row = dict(rows[int(i)])
-            row["score"] = round(s, 4)
+            row["score"] = round(vs, 4)          # 展示仍用余弦，含义直观
+            row["bm25"] = round(bs, 3)
+            row["rrf"] = round(fscore, 5)
+            row["kw"] = kw_strong
             hits.append(row)
-        best = float(scores[idx[0]]) if len(idx) else 0.0
 
-        # ------------------------------------------------------------------
-        # 区分度判据（margin）：只看绝对分数会误召回。
-        # 实测反例：问"写一个 python 快速排序"，计组教材的 3 个片段拿到
-        # 0.4605 / 0.4557 / 0.4539 —— 全部擦着阈值过线，且彼此只差 0.0066。
-        # 这说明模型对这段文本没有"明显偏好"，只是泛泛相关（背景噪声）。
-        # 真命中时通常有明显断层：0.6275 / 0.6134 / 0.6059（差 0.0216）。
-        # 所以：top1 - topN < margin 时判为噪声，直接当作没找到。
-        # ------------------------------------------------------------------
-        if len(hits) >= 2:
+        best = float(vec_scores.max()) if len(vec_scores) else 0.0
+        if not hits:
+            return [], best
+
+        # 单 hit 时算不出区分度，改用"擦线 + 关键词也不强"作为噪声判据。
+        # 反例：问"pandas 数据清洗"，只有一段擦到 0.4506，BM25 几乎为 0。
+        if len(hits) == 1:
+            h = hits[0]
+            if h["score"] < thr + 0.05 and not h["kw"]:
+                log.info("单段擦线且无关键词命中，判为噪声：score=%.3f bm25=%.2f",
+                         h["score"], h["bm25"])
+                return [], best
+            return hits, best
+
+        # 多 hit 时看区分度：分数扁平且关键词也不强 = 没有真正匹配。
+        # 注意：只有"来自不同页/不同文档"的命中才参与判定 ——
+        # 相邻块因为有 100 字重叠，分数天然接近，拿它算 margin 会误杀正常命中
+        # （实测："写直达和写回的区别" 0.529 被判噪声，就是被同页重叠块拖累的）。
+        pages_seen = {(h["source"], h["page"]) for h in hits}
+        if len(pages_seen) >= 2:
             margin = hits[0]["score"] - hits[-1]["score"]
-            if margin < self.cfg.min_margin and hits[0]["score"] < 0.62:
-                log.info("检索区分度不足，判为噪声：margin=%.4f (<%.3f) best=%.3f，已丢弃 %d 段",
-                         margin, self.cfg.min_margin, hits[0]["score"], len(hits))
+            if margin < self.cfg.min_margin and hits[0]["score"] < 0.62 and not hits[0]["kw"]:
+                log.info("检索区分度不足，判为噪声：margin=%.4f best=%.3f", margin, hits[0]["score"])
                 return [], best
 
         return hits, best
 
+    # ------------------------------------------------------------------ 原文
+    def page_text(self, source: str, page: int) -> str | None:
+        """取某文档某页的清洗后原文，供前端做引用高亮。"""
+        with self._conn() as con:
+            row = con.execute("SELECT text FROM pages WHERE source=? AND page=?",
+                              (source, page)).fetchone()
+        return row["text"] if row else None
+
     # ------------------------------------------------------------------ 管理
     @property
     def ready(self) -> bool:
-        """知识库是否可用（有向量且维度没出错）。空库时上层应退化为普通聊天。"""
         return self._matrix is not None and not self._error
 
     def list_documents(self) -> list[dict]:
         with self._conn() as con:
             rows = con.execute(
-                "SELECT source, COUNT(*) AS chunks, SUM(LENGTH(text)) AS chars, "
-                "MIN(page) AS first_page, MAX(page) AS last_page "
-                "FROM chunks GROUP BY source ORDER BY source"
-            ).fetchall()
+                "SELECT c.source, COUNT(*) AS chunks, SUM(LENGTH(c.text)) AS chars, "
+                "MIN(c.page) AS first_page, MAX(c.page) AS last_page, "
+                "f.size AS bytes, f.indexed_at "
+                "FROM chunks c LEFT JOIN files f ON f.source = c.source "
+                "GROUP BY c.source ORDER BY c.source").fetchall()
         return [dict(r) for r in rows]
 
     def delete_document(self, source: str) -> int:
         with self._lock, self._conn() as con:
             cur = con.execute("DELETE FROM chunks WHERE source=?", (source,))
+            con.execute("DELETE FROM pages WHERE source=?", (source,))
+            con.execute("DELETE FROM files WHERE source=?", (source,))
             con.commit()
-        # 同时删掉磁盘上的原文件，避免"删了但重启又被 build_from_dir 拉回来"
-        for p in Path(self.cfg.docs_dir).rglob(source):
+        # 同步删磁盘文件，避免下次 --rebuild 又把它拉回来
+        target = Path(self.cfg.docs_dir) / source
+        if target.exists():
             try:
-                p.unlink()
+                target.unlink()
             except OSError:
-                pass
+                log.warning("删除磁盘文件失败：%s", target)
         self.reload()
         log.info("删除文档：%s（%d 块）", source, cur.rowcount)
         return cur.rowcount
@@ -385,12 +478,14 @@ class RAGEngine:
     def stats(self) -> dict:
         docs = self.list_documents()
         return {
-            "ready": self._matrix is not None,
+            "ready": self.ready,
             "chunks": len(self._rows),
             "documents": len(docs),
             "dim": self._dim,
-            "embed_model": self._model,
+            "embed_model": self.cfg.embed_model,
             "min_score": self.cfg.min_score,
+            "min_margin": self.cfg.min_margin,
+            "hybrid": True,
             "error": self._error,
             "items": docs,
         }

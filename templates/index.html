@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Offline RAG Assistant · 本地知识库助教</title>
+<meta name="theme-color" content="#0b0e14">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
 <!-- Tailwind 使用本地文件：离线演示时 CDN 不可用，页面会变成白板 -->
 <script src="/static/vendor/tailwind.js"></script>
@@ -141,6 +147,23 @@
   </main>
 </div>
 
+<!-- ===================== 引用原文面板 ===================== -->
+<div id="srcModal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm p-3 lg:p-10">
+  <div class="max-w-3xl mx-auto h-full flex flex-col bg-ink-800 border border-line rounded-2xl overflow-hidden shadow-2xl">
+    <div class="flex items-center gap-3 px-4 py-3 border-b border-line shrink-0">
+      <span class="text-sky-400">📄</span>
+      <span id="srcTitle" class="text-sm text-slate-300 truncate"></span>
+      <div class="flex-1"></div>
+      <button id="srcClose" class="text-slate-400 hover:text-white text-lg leading-none px-2">✕</button>
+    </div>
+    <pre id="srcBody" class="flex-1 overflow-auto p-4 text-[13px] leading-7 text-slate-300
+                              whitespace-pre-wrap font-sans m-0"></pre>
+    <div class="px-4 py-2 border-t border-line text-[10px] text-slate-600 shrink-0">
+      蓝色高亮 = 模型实际读到的片段
+    </div>
+  </div>
+</div>
+
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
@@ -220,14 +243,50 @@ function addSources(list) {
   const row = document.createElement('div');
   row.className = 'flex flex-wrap gap-1.5 mt-2';
   list.forEach(s => {
-    const chip = document.createElement('span');
-    chip.className = 'text-[10px] px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/20';
-    chip.title = s.preview || '';
+    const chip = document.createElement('button');
+    chip.className = 'text-[10px] px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-300 ' +
+                     'border border-sky-500/20 hover:bg-sky-500/20 hover:border-sky-400/40 transition';
+    chip.title = (s.preview || '') + '\n点击查看原文';
     chip.textContent = `[${s.n}] ${s.source}${s.page ? ' p' + s.page : ''} · ${s.score}`;
+    chip.onclick = () => openSource(s);
     row.appendChild(chip);
   });
   logEl.lastElementChild.querySelector('.md')?.appendChild(row);
 }
+
+/* ---------------- 引用原文面板 ---------------- */
+async function openSource(s) {
+  const modal = document.getElementById('srcModal');
+  const body = document.getElementById('srcBody');
+  const title = document.getElementById('srcTitle');
+  title.textContent = `${s.source} · 第 ${s.page || 0} 页 · 相似度 ${s.score}`;
+  body.textContent = '加载中…';
+  modal.classList.remove('hidden');
+
+  try {
+    const url = `/api/source?doc=${encodeURIComponent(s.source)}&page=${s.page || 0}` +
+                `&start=${s.start || 0}&end=${s.end || 0}`;
+    const d = await (await fetch(url)).json();
+    if (!d.ok) throw new Error(d.error || '加载失败');
+
+    // 分三段拼：前文 / 命中片段（高亮）/ 后文。全程 textContent，天然无 XSS
+    body.textContent = '';
+    body.append(document.createTextNode(d.text.slice(0, d.start)));
+    const mark = document.createElement('mark');
+    mark.className = 'bg-sky-500/30 text-sky-100 rounded px-0.5';
+    mark.textContent = d.text.slice(d.start, d.end) || '（原文区间为空，可能是旧索引，请点「重建」）';
+    body.append(mark, document.createTextNode(d.text.slice(d.end)));
+    mark.scrollIntoView({ block: 'center' });
+  } catch (e) {
+    body.textContent = '原文加载失败：' + e.message;
+  }
+}
+
+document.getElementById('srcClose').onclick = () =>
+  document.getElementById('srcModal').classList.add('hidden');
+document.getElementById('srcModal').addEventListener('click', e => {
+  if (e.target.id === 'srcModal') document.getElementById('srcModal').classList.add('hidden');
+});
 
 function addMeta(text) {
   const el = document.createElement('div');
@@ -420,6 +479,11 @@ function greet() {
 }
 
 (async function boot() {
+  // 注册 Service Worker：装了它才能"添加到主屏幕"当 App 用
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+
   greet();
 
   // 健康检查 → 顶部状态灯
