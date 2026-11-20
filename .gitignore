@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 运行时数据（绝对不能进仓库）----
+data/db/
+data/db/*.db
+data/db/*.db-wal
+data/db/*.db-shm
+logs/
+*.log
+
+# 用户上传的文档：仓库里只保留 .gitkeep 和示例语料
+data/docs/*
+!data/docs/.gitkeep
+!data/docs/example-*
+
+# ---- 模型与二进制 ----
+*.gguf
+*.bin
+*.safetensors
+models/
+installer/
+*.exe
+
+# ---- 本地配置 ----
+.env
+.env.local
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

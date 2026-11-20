@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Offline RAG Assistant · 本地知识库助教</title>
+
+<!-- Tailwind 使用本地文件：离线演示时 CDN 不可用，页面会变成白板 -->
+<script src="/static/vendor/tailwind.js"></script>
+<link rel="stylesheet" href="/static/vendor/github-dark.min.css">
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink:  { 900:'#0b0e14', 800:'#11151d', 700:'#161b24', 600:'#1d2430' },
+          line: '#232b39',
+        },
+        fontFamily: {
+          sans: ['-apple-system','BlinkMacSystemFont','"Segoe UI"','"Microsoft YaHei"','sans-serif'],
+          mono: ['"JetBrains Mono"','Consolas','"Courier New"','monospace'],
+        }
+      }
+    }
+  }
+</script>
+<style>
+  html, body { height: 100%; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2a3342; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a4658; }
+  /* Markdown 正文排版：Tailwind 没带 typography 插件，这里手工补几条 */
+  .md p { margin: .5rem 0; }
+  .md ul, .md ol { margin: .5rem 0 .5rem 1.25rem; }
+  .md ul { list-style: disc; }
+  .md ol { list-style: decimal; }
+  .md li { margin: .2rem 0; }
+  .md h1, .md h2, .md h3 { font-weight: 600; margin: .9rem 0 .45rem; }
+  .md h1 { font-size: 1.15rem; } .md h2 { font-size: 1.05rem; } .md h3 { font-size: 1rem; }
+  .md code:not(pre code) {
+    background: #1b2230; border: 1px solid #2a3342; border-radius: 4px;
+    padding: .1rem .35rem; font-size: .85em; color: #9fd0ff;
+  }
+  .md pre { margin: .6rem 0; border-radius: .6rem; overflow: hidden; border: 1px solid #232b39; }
+  .md pre code { display: block; padding: .8rem 1rem; font-size: .85rem; line-height: 1.55; overflow-x: auto; }
+  .md table { border-collapse: collapse; margin: .6rem 0; font-size: .9em; }
+  .md th, .md td { border: 1px solid #2a3342; padding: .3rem .6rem; }
+  .md blockquote { border-left: 3px solid #2f6feb; padding-left: .7rem; color: #9aa7b8; margin: .5rem 0; }
+  .cursor::after { content: '▍'; animation: blink 1s steps(1) infinite; color: #7ad0ff; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .bubble-user { background: linear-gradient(135deg,#2563eb,#1d4ed8); }
+  .fade-in { animation: fadeIn .18s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+
+<body class="h-full bg-ink-900 text-slate-200 font-sans antialiased">
+
+<div class="flex h-full overflow-hidden">
+
+  <!-- ===================== 侧栏：知识库 ===================== -->
+  <aside id="sidebar"
+         class="fixed lg:static z-30 h-full w-80 shrink-0 -translate-x-full lg:translate-x-0
+                transition-transform duration-200 bg-ink-800 border-r border-line flex flex-col">
+    <div class="p-4 border-b border-line">
+      <div class="flex items-center gap-2">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-500 to-blue-600 grid place-items-center font-bold text-white">R</div>
+        <div class="min-w-0">
+          <div class="text-sm font-semibold truncate">Offline RAG Assistant</div>
+          <div class="text-[11px] text-slate-500 truncate">{{ model }} · {{ embed_model }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 上传区 -->
+    <div class="p-4 border-b border-line">
+      <label id="dropzone"
+             class="block cursor-pointer rounded-xl border border-dashed border-line hover:border-sky-500/60
+                    bg-ink-700/40 hover:bg-ink-700 transition p-4 text-center">
+        <input id="file" type="file" class="hidden" accept=".pdf,.txt,.md,.markdown" multiple>
+        <div class="text-2xl leading-none mb-1">📄</div>
+        <div class="text-sm text-slate-300">点击或拖拽上传文档</div>
+        <div class="text-[11px] text-slate-500 mt-1">PDF / TXT / MD，单个 ≤ {{ max_upload_mb }} MB</div>
+      </label>
+      <div id="uploadStatus" class="hidden mt-3 text-[12px] rounded-lg px-3 py-2"></div>
+    </div>
+
+    <!-- 文档列表 -->
+    <div class="flex-1 overflow-y-auto p-3">
+      <div class="flex items-center justify-between px-1 mb-2">
+        <span class="text-[11px] uppercase tracking-wider text-slate-500">知识库文档</span>
+        <button id="rebuildBtn" class="text-[11px] text-slate-500 hover:text-sky-400" title="清空并重新扫描 data/docs">重建</button>
+      </div>
+      <div id="docList" class="space-y-1"></div>
+    </div>
+
+    <!-- 底部状态 -->
+    <div class="p-3 border-t border-line text-[11px] text-slate-500 space-y-1">
+      <div class="flex justify-between"><span>向量块</span><span id="statChunks" class="text-slate-300">-</span></div>
+      <div class="flex justify-between"><span>向量维度</span><span id="statDim" class="text-slate-300">-</span></div>
+      <div class="flex justify-between"><span>相似度阈值</span><span id="statThresh" class="text-slate-300">-</span></div>
+      <div class="flex justify-between"><span>上下文</span><span class="text-slate-300">{{ num_ctx }} tok</span></div>
+    </div>
+  </aside>
+
+  <!-- 移动端遮罩 -->
+  <div id="overlay" class="hidden fixed inset-0 bg-black/50 z-20 lg:hidden"></div>
+
+  <!-- ===================== 主区：对话 ===================== -->
+  <main class="flex-1 flex flex-col min-w-0">
+    <header class="flex items-center gap-3 px-4 py-2.5 border-b border-line bg-ink-800/80 backdrop-blur">
+      <button id="menuBtn" class="lg:hidden text-slate-400 hover:text-white text-xl leading-none">☰</button>
+      <div class="flex items-center gap-2 min-w-0">
+        <span id="statusDot" class="w-2 h-2 rounded-full bg-slate-500"></span>
+        <span id="statusText" class="text-xs text-slate-400 truncate">正在检测 Ollama…</span>
+      </div>
+      <div class="flex-1"></div>
+      <span id="turnBadge" class="text-[11px] text-slate-500 hidden sm:inline">记忆 0 轮</span>
+      <button id="clearBtn"
+              class="text-xs px-2.5 py-1.5 rounded-lg border border-line text-slate-400
+                     hover:text-rose-300 hover:border-rose-500/40 hover:bg-rose-500/5 transition">
+        清空记忆
+      </button>
+    </header>
+
+    <div id="log" class="flex-1 overflow-y-auto px-4 py-5 space-y-4"></div>
+
+    <footer class="border-t border-line bg-ink-800/80 backdrop-blur p-3">
+      <div class="flex items-end gap-2 max-w-3xl mx-auto">
+        <textarea id="q" rows="1" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
+                  class="flex-1 resize-none bg-ink-700 border border-line rounded-xl px-3.5 py-2.5 text-sm
+                         placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 max-h-32"></textarea>
+        <button id="sendBtn"
+                class="shrink-0 h-11 px-5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40
+                       disabled:cursor-not-allowed text-sm font-medium transition">发送</button>
+      </div>
+      <div class="text-[10px] text-center text-slate-600 mt-2">
+        全部推理在本机完成 · 上下文 {{ num_ctx }} token · 数据不出这台电脑
+      </div>
+    </footer>
+  </main>
+</div>
+
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script src="/static/vendor/highlight.min.js"></script>
+<script>
+/* ==========================================================================
+   前端逻辑：流式接收 → Markdown 渲染 → 代码高亮
+   ========================================================================== */
+const logEl     = document.getElementById('log');
+const inputEl   = document.getElementById('q');
+const sendBtn   = document.getElementById('sendBtn');
+const clearBtn  = document.getElementById('clearBtn');
+const menuBtn   = document.getElementById('menuBtn');
+const overlay   = document.getElementById('overlay');
+const sidebar   = document.getElementById('sidebar');
+const docList   = document.getElementById('docList');
+const fileInput = document.getElementById('file');
+const dropzone  = document.getElementById('dropzone');
+const uploadStatus = document.getElementById('uploadStatus');
+
+marked.setOptions({ gfm: true, breaks: true });
+
+/* 渲染 Markdown 并高亮代码块；DOMPurify 负责去掉模型可能吐出的 <script> */
+function renderMarkdown(text) {
+  const raw = marked.parse(text || '');
+  const clean = DOMPurify.sanitize(raw, { ADD_ATTR: ['target', 'rel'] });
+  const holder = document.createElement('div');
+  holder.innerHTML = clean;
+  holder.querySelectorAll('pre code').forEach(block => {
+    try { hljs.highlightElement(block); } catch (e) { /* 未识别的语言忽略 */ }
+  });
+  // 给每个代码块加复制按钮
+  holder.querySelectorAll('pre').forEach(pre => {
+    pre.classList.add('relative', 'group');
+    const btn = document.createElement('button');
+    btn.textContent = '复制';
+    btn.className = 'absolute top-2 right-2 text-[11px] px-2 py-1 rounded bg-white/10 ' +
+                    'text-slate-300 opacity-0 group-hover:opacity-100 transition';
+    btn.onclick = () => {
+      navigator.clipboard.writeText(pre.innerText).then(() => {
+        btn.textContent = '已复制'; setTimeout(() => (btn.textContent = '复制'), 1200);
+      });
+    };
+    pre.appendChild(btn);
+  });
+  return holder;
+}
+
+function addMessage(role, text = '') {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex gap-3 fade-in ' + (role === 'user' ? 'justify-end' : 'justify-start');
+
+  const avatar = document.createElement('div');
+  avatar.className = 'shrink-0 w-8 h-8 rounded-lg grid place-items-center text-xs font-bold ' +
+    (role === 'user' ? 'order-2 bg-blue-600 text-white' : 'bg-ink-600 text-sky-300 border border-line');
+  avatar.textContent = role === 'user' ? '我' : 'AI';
+
+  const bubble = document.createElement('div');
+  bubble.className = role === 'user'
+    ? 'order-1 max-w-[85%] rounded-2xl rounded-tr-sm bubble-user text-white text-sm px-4 py-2.5 whitespace-pre-wrap'
+    : 'max-w-[92%] rounded-2xl rounded-tl-sm bg-ink-700 border border-line text-sm px-4 py-3 md';
+
+  if (role === 'user') bubble.textContent = text;
+  wrap.append(avatar, bubble);
+  logEl.appendChild(wrap);
+  logEl.scrollTop = logEl.scrollHeight;
+  return bubble;
+}
+
+function addSources(list) {
+  if (!list || !list.length) return;
+  const row = document.createElement('div');
+  row.className = 'flex flex-wrap gap-1.5 mt-2';
+  list.forEach(s => {
+    const chip = document.createElement('span');
+    chip.className = 'text-[10px] px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/20';
+    chip.title = s.preview || '';
+    chip.textContent = `[${s.n}] ${s.source}${s.page ? ' p' + s.page : ''} · ${s.score}`;
+    row.appendChild(chip);
+  });
+  logEl.lastElementChild.querySelector('.md')?.appendChild(row);
+}
+
+function addMeta(text) {
+  const el = document.createElement('div');
+  el.className = 'text-[10px] text-slate-600 mt-1.5';
+  el.textContent = text;
+  logEl.lastElementChild.querySelector('.md')?.appendChild(el);
+}
+
+/* ---------------- 知识库状态 ---------------- */
+async function refreshStats() {
+  try {
+    const s = await (await fetch('/api/stats')).json();
+    document.getElementById('statChunks').textContent = s.chunks ?? 0;
+    document.getElementById('statDim').textContent = s.dim || '-';
+    document.getElementById('statThresh').textContent = s.min_score ?? '-';
+    document.getElementById('turnBadge').textContent = `记忆 ${s.turns ?? 0} 轮`;
+    renderDocs(s.items || []);
+  } catch (e) { console.warn('stats failed', e); }
+}
+
+function renderDocs(items) {
+  if (!items.length) {
+    docList.innerHTML = `<div class="text-[12px] text-slate-600 px-1 py-2">
+      还没有文档，上传 PDF/TXT 或把文件放进 data/docs 后点「重建」</div>`;
+    return;
+  }
+  docList.innerHTML = '';
+  items.forEach(d => {
+    const row = document.createElement('div');
+    row.className = 'group flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-ink-700 text-[12px]';
+    row.innerHTML = `
+      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400/70 shrink-0"></span>
+      <span class="flex-1 truncate text-slate-300" title="${d.source}">${d.source}</span>
+      <span class="text-[10px] text-slate-500 shrink-0">${d.chunks} 块</span>
+      <button class="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-400 shrink-0"
+              title="删除">✕</button>`;
+    row.querySelector('button').onclick = async () => {
+      if (!confirm(`删除「${d.source}」及其全部向量块？`)) return;
+      row.style.opacity = .4;
+      await fetch('/api/documents/' + encodeURIComponent(d.source), { method: 'DELETE' });
+      refreshStats();
+    };
+    docList.appendChild(row);
+  });
+}
+
+/* ---------------- 上传 ---------------- */
+async function uploadFiles(files) {
+  if (!files || !files.length) return;
+  uploadStatus.className = 'mt-3 text-[12px] rounded-lg px-3 py-2 bg-sky-500/10 text-sky-300';
+  uploadStatus.textContent = `正在解析 ${files.length} 个文件…`;
+  for (const file of files) {
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.ok) {
+        uploadStatus.className = 'mt-3 text-[12px] rounded-lg px-3 py-2 bg-emerald-500/10 text-emerald-300';
+        uploadStatus.textContent = `✓ ${data.source}：${data.pages} 页 → ${data.chunks} 块（${data.ms} ms）`;
+      } else {
+        uploadStatus.className = 'mt-3 text-[12px] rounded-lg px-3 py-2 bg-rose-500/10 text-rose-300';
+        uploadStatus.textContent = `✗ ${file.name}：${data.error}`;
+      }
+    } catch (e) {
+      uploadStatus.className = 'mt-3 text-[12px] rounded-lg px-3 py-2 bg-rose-500/10 text-rose-300';
+      uploadStatus.textContent = `✗ ${file.name}：${e.message}`;
+    }
+  }
+  fileInput.value = '';
+  refreshStats();
+}
+
+fileInput.addEventListener('change', e => uploadFiles(e.target.files));
+['dragenter', 'dragover'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.add('border-sky-500', 'bg-sky-500/5');
+}));
+['dragleave', 'drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.remove('border-sky-500', 'bg-sky-500/5');
+}));
+dropzone.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
+
+document.getElementById('rebuildBtn').onclick = async () => {
+  if (!confirm('清空现有向量库并用 data/docs 重新入库？')) return;
+  uploadStatus.className = 'mt-3 text-[12px] rounded-lg px-3 py-2 bg-amber-500/10 text-amber-300';
+  uploadStatus.textContent = '重建中…';
+  const r = await (await fetch('/api/rebuild', { method: 'POST' })).json();
+  uploadStatus.textContent = r.ok
+    ? `✓ 重建完成：${r.documents.length} 篇 / ${r.chunks} 块`
+    : `✗ 重建失败：${r.error}`;
+  refreshStats();
+};
+
+/* ---------------- 发送 ---------------- */
+let busy = false;
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text || busy) return;
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  busy = true; sendBtn.disabled = true;
+
+  addMessage('user', text);
+  const bubble = addMessage('assistant', '');
+  bubble.classList.add('cursor');
+  const t0 = performance.now();
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || ('HTTP ' + res.status));
+    }
+
+    let sources = [];
+    const rawSources = res.headers.get('X-Sources');
+    if (rawSources) { try { sources = JSON.parse(atob(rawSources)); } catch (e) {} }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let full = '', lastPaint = 0;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      full += decoder.decode(value, { stream: true });
+      // 流式渲染节流：每 80ms 重渲染一次，避免每个 token 都跑一遍 marked
+      const now = performance.now();
+      if (now - lastPaint > 80) {
+        bubble.replaceChildren(renderMarkdown(full));
+        logEl.scrollTop = logEl.scrollHeight;
+        lastPaint = now;
+      }
+    }
+    bubble.classList.remove('cursor');
+    bubble.replaceChildren(renderMarkdown(full));
+
+    if (full.startsWith('知识库中未找到相关内容')) {
+      bubble.classList.add('border-amber-500/40', 'bg-amber-500/5');
+    }
+    addSources(sources);
+    addMeta(`本地推理 · ${(performance.now() - t0).toFixed(1)}s` +
+            (sources.length ? ` · 命中 ${sources.length} 段` : ' · 未命中知识库'));
+    refreshStats();
+  } catch (e) {
+    bubble.classList.remove('cursor');
+    bubble.innerHTML = `<span class="text-rose-300">请求失败：${e.message}</span>`;
+  } finally {
+    busy = false; sendBtn.disabled = false; inputEl.focus();
+  }
+}
+
+sendBtn.onclick = send;
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 128) + 'px';
+});
+
+clearBtn.onclick = async () => {
+  if (!confirm('清空本会话的全部对话记忆？')) return;
+  await fetch('/api/reset', { method: 'POST' });
+  logEl.innerHTML = '';
+  greet();
+  refreshStats();
+};
+
+/* ---------------- 侧栏（移动端） ---------------- */
+function toggleSidebar(open) {
+  sidebar.classList.toggle('-translate-x-full', !open);
+  overlay.classList.toggle('hidden', !open);
+}
+menuBtn.onclick = () => toggleSidebar(sidebar.classList.contains('-translate-x-full'));
+overlay.onclick = () => toggleSidebar(false);
+
+/* ---------------- 启动 ---------------- */
+function greet() {
+  addMessage('assistant',
+    '我是运行在这台电脑上的本地模型：可以查 `data/docs` 里的知识库，也会记住这次对话。' +
+    '网络已断开，所有推理都在本机 GPU 上完成。\n\n试着问一个教材里的问题，或者上传一份 PDF。');
+}
+
+(async function boot() {
+  greet();
+
+  // 健康检查 → 顶部状态灯
+  try {
+    const h = await (await fetch('/api/health')).json();
+    const dot = document.getElementById('statusDot');
+    dot.className = 'w-2 h-2 rounded-full ' + (h.ok ? 'bg-emerald-400' : 'bg-rose-500');
+    document.getElementById('statusText').textContent =
+      h.ok ? `Ollama ${h.ollama} · ${h.model}` : 'Ollama 未连接';
+  } catch (e) {
+    document.getElementById('statusText').textContent = '无法连接后端';
+  }
+
+  // 恢复历史
+  try {
+    const d = await (await fetch('/api/history')).json();
+    (d.messages || []).forEach(m => {
+      const b = addMessage(m.role === 'user' ? 'user' : 'assistant', '');
+      if (m.role === 'user') b.textContent = m.content;
+      else b.replaceChildren(renderMarkdown(m.content));
+    });
+  } catch (e) { /* 首次访问无历史 */ }
+
+  refreshStats();
+})();
+</script>
+</body>
+</html>
